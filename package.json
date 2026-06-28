@@ -1,0 +1,20 @@
+{
+  "name": "supernovba",
+  "version": "0.1.0",
+  "private": true,
+  "description": "跨平台 AI 多模态营销物料生成工具",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace=@supernovba/web",
+    "dev:mobile": "npm run dev --workspace=@supernovba/mobile",
+    "build:web": "npm run build --workspace=@supernovba/web",
+    "lint": "echo 'lint placeholder'",
+    "typecheck": "echo 'typecheck placeholder'"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
