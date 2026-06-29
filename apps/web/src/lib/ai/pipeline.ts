@@ -1,6 +1,3 @@
-import { createOpenAI } from "@ai-sdk/openai";
-import { generateText, generateObject } from "ai";
-import { z } from "zod";
 import {
   buildProductAnalysisPrompt,
   buildAngleGenerationPrompt,
@@ -16,33 +13,91 @@ import type {
 import { CREATIVE_ANGLES } from "./types";
 
 // ============================================================
-// DeepSeek 客户端配置
+// DeepSeek Chat Completion（纯 fetch，避免 SDK 兼容问题）
 // ============================================================
 
-function getDeepSeekClient() {
+function getDeepSeekConfig() {
   const apiKey = process.env.DEEPSEEK_API_KEY;
-  if (!apiKey) {
-    throw new Error("Missing DEEPSEEK_API_KEY environment variable");
-  }
+  if (!apiKey) throw new Error("Missing DEEPSEEK_API_KEY");
 
-  // 确保 baseURL 以 /v1 结尾（SDK 需要完整路径来拼接 /chat/completions）
-  let baseURL = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com/v1";
-  if (!baseURL.endsWith("/v1")) {
-    baseURL = baseURL.replace(/\/$/, "") + "/v1";
-  }
+  const base =
+    (process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com").replace(
+      /\/$/,
+      ""
+    ) + "/v1";
+  const model = process.env.DEEPSEEK_MODEL || "deepseek-v4-pro";
 
-  return createOpenAI({
-    apiKey,
-    baseURL,
-  });
+  return { apiKey, baseURL: base, model };
 }
 
-function getDeepSeekModel() {
-  return process.env.DEEPSEEK_MODEL || "deepseek-v4-pro";
+interface ChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+async function chatCompletion(params: {
+  messages: ChatMessage[];
+  temperature?: number;
+  maxTokens?: number;
+}): Promise<string> {
+  const { apiKey, baseURL, model } = getDeepSeekConfig();
+  const url = `${baseURL}/chat/completions`;
+
+  const body = JSON.stringify({
+    model,
+    messages: params.messages,
+    temperature: params.temperature ?? 0.7,
+    max_tokens: params.maxTokens ?? 2000,
+  });
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body,
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(
+      `DeepSeek API ${response.status}: ${errText.slice(0, 300)}`
+    );
+  }
+
+  const data = await response.json();
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error(
+      `DeepSeek 返回为空: ${JSON.stringify(data).slice(0, 300)}`
+    );
+  }
+
+  return content;
 }
 
 // ============================================================
-// 工具函数：生成唯一 ID
+// 从 LLM 响应中提取 JSON（兼容 markdown code block）
+// ============================================================
+
+function extractJson(text: string): string {
+  // 去掉 markdown ```json ... ``` 包裹
+  const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (codeBlockMatch) return codeBlockMatch[1].trim();
+
+  // 尝试找到第一个 { 到最后一个 }
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    return text.slice(firstBrace, lastBrace + 1);
+  }
+
+  return text.trim();
+}
+
+// ============================================================
+// 工具函数
 // ============================================================
 
 function generateId(): string {
@@ -52,14 +107,6 @@ function generateId(): string {
 // ============================================================
 // 阶段1：产品分析
 // ============================================================
-
-const productProfileSchema = z.object({
-  name: z.string(),
-  features: z.array(z.string()).min(3).max(8),
-  targetAudience: z.string(),
-  uniqueSellingPoint: z.string(),
-  category: z.string(),
-});
 
 async function stage1_analyzeProduct(
   description: string,
@@ -73,28 +120,33 @@ async function stage1_analyzeProduct(
     progress: 10,
   });
 
-  const deepseek = getDeepSeekClient();
   const prompt = buildProductAnalysisPrompt({ description, imageAnalysis });
 
-  const result = await generateObject({
-    model: deepseek(getDeepSeekModel()),
-    schema: productProfileSchema,
-    prompt,
+  const raw = await chatCompletion({
+    messages: [{ role: "user", content: prompt }],
     temperature: 0.7,
   });
 
-  return result.object;
+  const json = extractJson(raw);
+  const parsed = JSON.parse(json) as ProductProfile;
+
+  // 基本校验
+  if (!parsed.name || !Array.isArray(parsed.features)) {
+    throw new Error(`产品分析返回格式错误: ${raw.slice(0, 200)}`);
+  }
+
+  return parsed;
 }
 
 // ============================================================
-// 阶段2：多角度并行生成 ⭐ 核心差异化
+// 阶段2：单角度创意生成
 // ============================================================
 
-const angleResultSchema = z.object({
-  headline: z.string().max(80),
-  body: z.string().max(200),
-  visualConcept: z.string(),
-});
+interface AngleResult {
+  headline: string;
+  body: string;
+  visualConcept: string;
+}
 
 async function stage2_generateSingleAngle(
   product: ProductProfile,
@@ -116,48 +168,44 @@ async function stage2_generateSingleAngle(
     angleLabel: angle.label,
   });
 
-  const deepseek = getDeepSeekClient();
   const prompt = buildAngleGenerationPrompt(product, angle);
 
-  const result = await generateObject({
-    model: deepseek(getDeepSeekModel()),
-    schema: angleResultSchema,
-    prompt,
-    temperature: 0.9, // 高 temperature 确保多样性
+  const raw = await chatCompletion({
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.9,
   });
 
-  // 阶段3（合并）：为这个角度生成优化的图片提示词
+  const json = extractJson(raw);
+  const parsed = JSON.parse(json) as AngleResult;
+
+  if (!parsed.headline || !parsed.body) {
+    throw new Error(
+      `角度生成返回格式错误 (${angle.label}): ${raw.slice(0, 200)}`
+    );
+  }
+
+  // 生成优化的图片提示词
   const imagePrompt = await enhanceImagePrompt(
-    result.object.headline,
-    result.object.body,
-    result.object.visualConcept,
+    parsed.headline,
+    parsed.body,
+    parsed.visualConcept || "",
     product.name,
     angle.label
   );
 
-  const cardData = {
-    headline: result.object.headline,
-    body: result.object.body,
+  return {
+    headline: parsed.headline,
+    body: parsed.body,
     imagePrompt,
     angleType: angle.type,
     angleLabel: angle.label,
     cardIndex,
   };
-
-  onEvent?.({
-    type: "angle_result",
-    cardIndex,
-    headline: cardData.headline,
-    body: cardData.body,
-    imagePrompt: cardData.imagePrompt,
-    angleType: cardData.angleType as SSEEvent extends { type: "angle_result" }
-      ? SSEEvent["angleType"]
-      : never,
-    angleLabel: cardData.angleLabel,
-  });
-
-  return cardData;
 }
+
+// ============================================================
+// 阶段3：图片提示词优化
+// ============================================================
 
 async function enhanceImagePrompt(
   headline: string,
@@ -166,24 +214,22 @@ async function enhanceImagePrompt(
   productName: string,
   angleLabel: string
 ): Promise<string> {
-  const deepseek = getDeepSeekClient();
   const prompt = buildImagePromptEnhancement(
     visualConcept,
     productName,
     angleLabel
   );
 
-  const result = await generateText({
-    model: deepseek(getDeepSeekModel()),
-    prompt,
+  const result = await chatCompletion({
+    messages: [{ role: "user", content: prompt }],
     temperature: 0.7,
   });
 
-  return result.text.trim();
+  return result.trim();
 }
 
 // ============================================================
-// 阶段4：图片生成（并行，含轮询）
+// 阶段4：图片生成
 // ============================================================
 
 async function stage4_generateImageForCard(
@@ -205,8 +251,7 @@ async function stage4_generateImageForCard(
     });
     return imageUrl;
   } catch (error) {
-    console.error(`Image generation failed for card ${cardIndex}:`, error);
-    // 图片生成失败不阻塞流程，返回 null
+    console.error(`图片生成失败 (card ${cardIndex}):`, error);
     return null;
   }
 }
@@ -216,15 +261,9 @@ async function stage4_generateImageForCard(
 // ============================================================
 
 export async function runGenerationPipeline(
-  input: {
-    description: string;
-    imageBase64?: string;
-  },
+  input: { description: string; imageBase64?: string },
   onEvent: (event: SSEEvent) => void,
-  options?: {
-    angleCount?: number; // 生成几个角度，默认 5
-    imageCount?: number; // 其中几张配图，默认 2
-  }
+  options?: { angleCount?: number; imageCount?: number }
 ): Promise<MarketingCard[]> {
   const angleCount = options?.angleCount ?? 5;
   const imageCount = options?.imageCount ?? 2;
@@ -233,49 +272,42 @@ export async function runGenerationPipeline(
     // ── 阶段1：产品分析 ──
     const product = await stage1_analyzeProduct(
       input.description,
-      input.imageBase64 ? "[图片已上传，基于描述分析]" : undefined,
+      input.imageBase64 ? "[图片已上传]" : undefined,
       onEvent
     );
 
-    // ⚠️ 如果有图片 base64，需要先做图片理解
-    // TODO: 接入多模态模型（如 GPT-4o）做图片分析
-    // 当前版本：基于文字描述分析
-    if (input.imageBase64) {
-      console.log(
-        "Image input received, multimodal analysis will be added in future version"
-      );
-    }
+    console.log("[Pipeline] 产品分析完成:", product.name);
 
     // ── 阶段2+3：多角度并行生成 ──
-    onEvent?.({
+    onEvent({
       type: "status",
       stage: "generating_angles",
       message: "正在构思创意营销角度...",
       progress: 30,
     });
 
-    // 随机选取角度（确保每次都有不同的创意组合）
     const selectedAngles = selectAngles(angleCount);
 
-    // 并行生成所有角度
     const angleResults = await Promise.all(
       selectedAngles.map((angle, index) =>
         stage2_generateSingleAngle(product, angle, index, onEvent)
       )
     );
 
-    // ── 阶段4：图片生成（仅前 N 张卡片配图） ──
-    onEvent?.({
+    console.log(
+      `[Pipeline] 角度生成完成: ${angleResults.length} 个角度`
+    );
+
+    // ── 阶段4：图片生成 ──
+    onEvent({
       type: "status",
       stage: "generating_images",
       message: "正在生成营销视觉...",
       progress: 70,
     });
 
-    // 选择前 imageCount 张卡片生成配图
     const cardsToIllustrate = angleResults.slice(0, imageCount);
 
-    // 并行生成图片
     const imageUrls = await Promise.all(
       cardsToIllustrate.map((card) =>
         stage4_generateImageForCard(card.imagePrompt, card.cardIndex, onEvent)
@@ -283,7 +315,7 @@ export async function runGenerationPipeline(
     );
 
     // ── 阶段5：组装卡片 ──
-    onEvent?.({
+    onEvent({
       type: "status",
       stage: "assembling",
       message: "正在组装营销卡片...",
@@ -305,9 +337,9 @@ export async function runGenerationPipeline(
 
     return cards;
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "未知错误";
-    onEvent?.({
+    const message = error instanceof Error ? error.message : "未知错误";
+    console.error("[Pipeline] 错误:", message);
+    onEvent({
       type: "error",
       message: `生成失败：${message}`,
       retryable: true,
@@ -317,7 +349,7 @@ export async function runGenerationPipeline(
 }
 
 // ============================================================
-// 辅助函数：随机选取角度
+// 辅助函数
 // ============================================================
 
 function selectAngles(count: number): AngleDefinition[] {

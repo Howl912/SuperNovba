@@ -53,6 +53,11 @@ export async function POST(request: NextRequest) {
         };
 
         try {
+          console.log("[API] Starting generation pipeline...");
+          console.log("[API] DeepSeek Base URL:", process.env.DEEPSEEK_BASE_URL);
+          console.log("[API] DeepSeek Model:", process.env.DEEPSEEK_MODEL);
+          console.log("[API] Has API Key:", !!process.env.DEEPSEEK_API_KEY);
+
           const cards = await runGenerationPipeline(
             { description, imageBase64 },
             sendEvent,
