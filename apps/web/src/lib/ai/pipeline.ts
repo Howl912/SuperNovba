@@ -25,9 +25,15 @@ function getDeepSeekClient() {
     throw new Error("Missing DEEPSEEK_API_KEY environment variable");
   }
 
+  // 确保 baseURL 以 /v1 结尾（SDK 需要完整路径来拼接 /chat/completions）
+  let baseURL = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com/v1";
+  if (!baseURL.endsWith("/v1")) {
+    baseURL = baseURL.replace(/\/$/, "") + "/v1";
+  }
+
   return createOpenAI({
     apiKey,
-    baseURL: process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com/v1",
+    baseURL,
   });
 }
 

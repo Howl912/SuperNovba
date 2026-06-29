@@ -1,126 +1,57 @@
 // ============================================================
-// Seedream 5.0 图片生成接口（火山引擎）
+// Seedream 5.0 图片生成接口（火山引擎 Ark 平台）
 // ============================================================
 //
+// 鉴权方式：API Key（Bearer Token）
 // API 文档：https://www.volcengine.com/docs/6791/
 //
-// Seedream 是异步图片生成 API：
-// 1. POST 提交生成任务 → 获取 task_id
-// 2. GET 轮询任务状态 → 获取结果图片 URL
-// 3. 下载并上传到 Supabase Storage（持久化）
-//
-// 当前实现：完整 API 集成逻辑，API Key 就绪后即可使用
-// 测试阶段：返回占位图
+// 流程：
+// 1. POST /api/v3/images/generations → 提交生成任务
+// 2. 若返回 data[].url → 同步完成，直接使用
+//    若返回 id → 异步任务，轮询 GET /api/v3/images/generations/{id}
+// 3. 下载图片 → 上传到 Supabase Storage 持久化
 
-const VOLCENGINE_API_HOST = "https://visual.volcengineapi.com";
-const MAX_POLL_ATTEMPTS = 30; // 最多轮询 30 次
-const POLL_INTERVAL_MS = 1000; // 每次轮询间隔 1 秒
+const MAX_POLL_ATTEMPTS = 30;
+const POLL_INTERVAL_MS = 2000; // 每次轮询间隔 2 秒
 
-interface SeedreamTaskResponse {
-  code: number;
-  message: string;
-  data: {
-    task_id: string;
-  };
+// ============================================================
+// Ark API 响应类型
+// ============================================================
+
+interface ArkImageSyncResponse {
+  created: number;
+  data: Array<{ url: string }>;
 }
 
-interface SeedreamQueryResponse {
-  code: number;
-  message: string;
-  data: {
-    task_id: string;
-    status: "pending" | "processing" | "completed" | "failed";
-    output?: {
-      image_urls: string[];
-    };
-    fail_reason?: string;
+interface ArkImageAsyncResponse {
+  id: string;
+  model: string;
+  status: "queued" | "running" | "succeeded" | "failed";
+  output?: {
+    results: Array<{ url: string }>;
   };
-}
-
-function getVolcEngineCredentials(): {
-  accessKey: string;
-  secretKey: string;
-} {
-  const accessKey = process.env.VOLCENGINE_ACCESS_KEY;
-  const secretKey = process.env.VOLCENGINE_SECRET_KEY;
-
-  if (!accessKey || !secretKey) {
-    console.warn(
-      "Volcengine credentials not configured. Image generation will use placeholders."
-    );
-    return { accessKey: "", secretKey: "" };
-  }
-
-  return { accessKey, secretKey };
+  error?: { message: string };
 }
 
 // ============================================================
-// 火山引擎签名（HMAC-SHA256）
+// 环境变量读取
 // ============================================================
 
-async function signRequest(
-  method: string,
-  path: string,
-  query: string,
-  body: string,
-  accessKey: string,
-  secretKey: string
-): Promise<Record<string, string>> {
-  // 简化的火山引擎 V4 签名实现
-  // 生产环境建议使用官方 SDK
-  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+function getConfig() {
+  const apiKey = process.env.VOLCENGINE_API_KEY;
+  const model =
+    process.env.VOLCENGINE_MODEL || "doubao-seedream-5.0-260128";
+  const host =
+    process.env.VOLCENGINE_API_HOST || "https://ark.cn-beijing.volces.com";
 
-  // 构建待签名字符串
-  const contentHash = await sha256(body);
-  const signedHeaders = "content-type;host;x-date";
-  const canonicalRequest = [
-    method,
-    path,
-    query,
-    `content-type:application/json`,
-    `host:visual.volcengineapi.com`,
-    `x-date:${timestamp}`,
-    "",
-    signedHeaders,
-    contentHash,
-  ].join("\n");
+  return { apiKey, model, host };
+}
 
-  const credentialScope = `${timestamp.slice(0, 8)}/cn-north-1/visual/request`;
-  const stringToSign = [
-    "HMAC-SHA256",
-    timestamp,
-    credentialScope,
-    await sha256(canonicalRequest),
-  ].join("\n");
-
-  // 派生签名密钥
-  const kDate = await hmacSha256(secretKey, timestamp.slice(0, 8));
-  const kRegion = await hmacSha256(kDate, "cn-north-1");
-  const kService = await hmacSha256(kRegion, "visual");
-  const kSigning = await hmacSha256(kService, "request");
-
-  // Web Crypto API 不直接支持 hex 输出，使用 Node.js crypto
-  const { createHmac } = await import("crypto");
-  // 签名已在上面的 Web Crypto 流程中完成
-  // 此处简化处理：返回基础 header，实际调用依赖服务端签名
+function getAuthHeaders(apiKey: string): Record<string, string> {
   return {
     "Content-Type": "application/json",
-    "X-Date": timestamp,
-    Authorization: `HMAC-SHA256 Credential=${accessKey}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=PLACEHOLDER`,
+    Authorization: `Bearer ${apiKey}`,
   };
-}
-
-async function sha256(data: string): Promise<string> {
-  const crypto = await import("crypto");
-  return crypto.createHash("sha256").update(data).digest("hex");
-}
-
-async function hmacSha256(
-  key: string | Buffer,
-  data: string
-): Promise<Buffer> {
-  const crypto = await import("crypto");
-  return crypto.createHmac("sha256", key).update(data).digest();
 }
 
 // ============================================================
@@ -128,167 +59,138 @@ async function hmacSha256(
 // ============================================================
 
 export async function generateImage(prompt: string): Promise<string> {
-  const { accessKey, secretKey } = getVolcEngineCredentials();
+  const { apiKey, model, host } = getConfig();
 
-  // ── 未配置 API Key：返回占位图（开发阶段） ──
-  if (!accessKey || !secretKey) {
-    console.log(`[Seedream Placeholder] Would generate image for: ${prompt}`);
+  // ── 未配置 API Key：返回占位图 ──
+  if (!apiKey) {
+    console.log(`[Seedream Placeholder] Would generate: ${prompt.slice(0, 60)}...`);
     return generatePlaceholderImage(prompt);
   }
 
-  // ── 正式流程：调用 Seedream API ──
   try {
     // Step 1: 提交生成任务
-    const taskId = await submitImageTask(prompt, accessKey, secretKey);
+    const body = JSON.stringify({
+      model,
+      prompt,
+      n: 1,
+      size: "1024x1024",
+    });
 
-    // Step 2: 轮询直到生成完成
-    const imageUrl = await pollImageTask(taskId, accessKey, secretKey);
+    const submitUrl = `${host}/api/v3/images/generations`;
+    console.log(`[Seedream] Submitting to: ${submitUrl}`);
 
-    // Step 3: 下载并上传到 Supabase Storage（持久化）
-    const persistentUrl = await uploadToStorage(imageUrl);
+    const response = await fetch(submitUrl, {
+      method: "POST",
+      headers: getAuthHeaders(apiKey),
+      body,
+    });
 
-    return persistentUrl;
+    if (!response.ok) {
+      const errBody = await response.text();
+      throw new Error(
+        `Seedream API 请求失败 (${response.status}): ${errBody.slice(0, 200)}`
+      );
+    }
+
+    const result = await response.json();
+    console.log(
+      `[Seedream] Response keys: ${Object.keys(result).join(", ")}`
+    );
+
+    // ── 同步完成：response.data[].url 直接可用 ──
+    if (result.data?.[0]?.url) {
+      const imageUrl = (result as ArkImageSyncResponse).data[0].url;
+      return await uploadToStorage(imageUrl);
+    }
+
+    // ── 异步任务：response.id → 轮询 ──
+    if (result.id) {
+      const taskId = result.id;
+      console.log(`[Seedream] Async task created: ${taskId}`);
+      const imageUrl = await pollTask(taskId, apiKey, host);
+      return await uploadToStorage(imageUrl);
+    }
+
+    throw new Error(
+      `Seedream 返回格式未知: ${JSON.stringify(result).slice(0, 300)}`
+    );
   } catch (error) {
-    console.error("Seedream image generation failed:", error);
+    console.error("[Seedream] Generation failed:", error);
     throw error;
   }
 }
 
 // ============================================================
-// Step 1: 提交生成任务
+// 轮询异步任务
 // ============================================================
 
-async function submitImageTask(
-  prompt: string,
-  accessKey: string,
-  secretKey: string
-): Promise<string> {
-  const body = JSON.stringify({
-    req_key: "seedream-5.0",
-    prompt,
-    negative_prompt: "low quality, blurry, text, watermark, logo, ugly",
-    width: 1024,
-    height: 1024,
-    num_images: 1,
-    sampler: "DPM++ 2M Karras",
-    cfg_scale: 7.0,
-    steps: 25,
-    seed: -1,
-  });
-
-  const headers = await signRequest(
-    "POST",
-    "/api/v1/visual/seedream5",
-    "Action=CVSync2AsyncSubmitTask&Version=2024-01-01",
-    body,
-    accessKey,
-    secretKey
-  );
-
-  const response = await fetch(
-    `${VOLCENGINE_API_HOST}/api/v1/visual/seedream5?Action=CVSync2AsyncSubmitTask&Version=2024-01-01`,
-    {
-      method: "POST",
-      headers,
-      body,
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `Seedream task submission failed: ${response.status} ${response.statusText}`
-    );
-  }
-
-  const data: SeedreamTaskResponse = await response.json();
-  if (data.code !== 0) {
-    throw new Error(`Seedream API error: ${data.message}`);
-  }
-
-  return data.data.task_id;
-}
-
-// ============================================================
-// Step 2: 轮询任务状态
-// ============================================================
-
-async function pollImageTask(
+async function pollTask(
   taskId: string,
-  accessKey: string,
-  secretKey: string
+  apiKey: string,
+  host: string
 ): Promise<string> {
   for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
-    const query = `Action=CVSync2AsyncGetResult&Version=2024-01-01&task_id=${taskId}`;
-    const headers = await signRequest(
-      "GET",
-      "/api/v1/visual/seedream5",
-      query,
-      "",
-      accessKey,
-      secretKey
-    );
-
-    const response = await fetch(
-      `${VOLCENGINE_API_HOST}/api/v1/visual/seedream5?${query}`,
-      { method: "GET", headers }
-    );
+    const pollUrl = `${host}/api/v3/images/generations/${taskId}`;
+    const response = await fetch(pollUrl, {
+      method: "GET",
+      headers: getAuthHeaders(apiKey),
+    });
 
     if (!response.ok) {
       throw new Error(
-        `Seedream task query failed: ${response.status}`
+        `Seedream 轮询失败 (${response.status}): ${await response.text()}`
       );
     }
 
-    const data: SeedreamQueryResponse = await response.json();
+    const result: ArkImageAsyncResponse = await response.json();
 
-    if (data.data.status === "completed") {
-      const imageUrl = data.data.output?.image_urls?.[0];
-      if (!imageUrl) {
-        throw new Error("Seedream returned no image URL");
-      }
+    if (result.status === "succeeded") {
+      const imageUrl = result.output?.results?.[0]?.url;
+      if (!imageUrl) throw new Error("Seedream 返回结果中没有图片 URL");
       return imageUrl;
     }
 
-    if (data.data.status === "failed") {
+    if (result.status === "failed") {
       throw new Error(
-        `Seedream generation failed: ${data.data.fail_reason || "unknown"}`
+        `Seedream 生成失败: ${result.error?.message || "未知原因"}`
       );
     }
 
-    // 等待后继续轮询
+    // 打印轮询进度
+    if (attempt % 5 === 0) {
+      console.log(
+        `[Seedream] 轮询中... task=${taskId} status=${result.status} (第${attempt + 1}次)`
+      );
+    }
+
     await sleep(POLL_INTERVAL_MS);
   }
 
-  throw new Error("Seedream task timed out after 30 seconds");
+  throw new Error(`Seedream 任务超时（已轮询 ${MAX_POLL_ATTEMPTS} 次）`);
 }
 
 // ============================================================
-// Step 3: 上传到 Supabase Storage（持久化）
+// 上传到 Supabase Storage（持久化）
 // ============================================================
 
 async function uploadToStorage(imageUrl: string): Promise<string> {
-  // TODO: 实现 Supabase Storage 上传
-  // 1. 下载 imageUrl 的图片
-  // 2. 上传到 supabase storage bucket "generated-images"
-  // 3. 返回 Supabase 公共 URL
-  //
-  // 当前：直接返回原始 URL（Seedream 的 URL 有有效期限制）
-  console.log(`[Storage] Would persist image from: ${imageUrl}`);
+  // TODO: 生产环境应下载图片并上传到 Supabase Storage
+  // Seedream 返回的 URL 有过期时间（通常 24h）
+  console.log(`[Storage] 图片生成成功: ${imageUrl.slice(0, 80)}...`);
   return imageUrl;
 }
 
 // ============================================================
-// 占位图生成（开发阶段，无 API Key 时使用）
+// 占位图（无 API Key 时使用）
 // ============================================================
 
 function generatePlaceholderImage(prompt: string): string {
-  // 使用渐变色 SVG 作为占位图
   const colors = [
-    ["#6366f1", "#8b5cf6"], // 紫色系
-    ["#ec4899", "#f43f5e"], // 粉色系
-    ["#06b6d4", "#3b82f6"], // 蓝色系
-    ["#f59e0b", "#ef4444"], // 橙色系
-    ["#10b981", "#6366f1"], // 绿色系
+    ["#6366f1", "#8b5cf6"],
+    ["#ec4899", "#f43f5e"],
+    ["#06b6d4", "#3b82f6"],
+    ["#f59e0b", "#ef4444"],
+    ["#10b981", "#6366f1"],
   ];
   const [c1, c2] = colors[Math.floor(Math.random() * colors.length)];
 
@@ -306,8 +208,7 @@ function generatePlaceholderImage(prompt: string): string {
   </text>
 </svg>`;
 
-  const base64 = Buffer.from(svg).toString("base64");
-  return `data:image/svg+xml;base64,${base64}`;
+  return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
 }
 
 // ============================================================
