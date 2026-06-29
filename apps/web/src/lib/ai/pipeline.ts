@@ -37,6 +37,10 @@ function getDeepSeekClient() {
   });
 }
 
+function getDeepSeekModel() {
+  return process.env.DEEPSEEK_MODEL || "deepseek-v4-pro";
+}
+
 // ============================================================
 // 工具函数：生成唯一 ID
 // ============================================================
@@ -73,7 +77,7 @@ async function stage1_analyzeProduct(
   const prompt = buildProductAnalysisPrompt({ description, imageAnalysis });
 
   const result = await generateObject({
-    model: deepseek("deepseek-chat"),
+    model: deepseek(getDeepSeekModel()),
     schema: productProfileSchema,
     prompt,
     temperature: 0.7,
@@ -116,7 +120,7 @@ async function stage2_generateSingleAngle(
   const prompt = buildAngleGenerationPrompt(product, angle);
 
   const result = await generateObject({
-    model: deepseek("deepseek-chat"),
+    model: deepseek(getDeepSeekModel()),
     schema: angleResultSchema,
     prompt,
     temperature: 0.9, // 高 temperature 确保多样性
@@ -170,7 +174,7 @@ async function enhanceImagePrompt(
   );
 
   const result = await generateText({
-    model: deepseek("deepseek-chat"),
+    model: deepseek(getDeepSeekModel()),
     prompt,
     temperature: 0.7,
   });
